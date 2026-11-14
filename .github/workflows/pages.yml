@@ -1,0 +1,41 @@
+# Builds the app and publishes it on GitHub Pages:
+# https://gumenion594-ai.github.io/nasa-project/
+# Runs on every push to main, or by hand (Actions tab -> "Publish to GitHub Pages" -> Run workflow).
+#
+# The built site is pushed to the `gh-pages` branch. In the repo's Settings -> Pages, the source
+# is "Deploy from a branch" with branch `gh-pages`, folder `/ (root)`.
+name: Publish to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # to push the built site to the gh-pages branch
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Push the built site to gh-pages
+        run: |
+          cd dist
+          touch .nojekyll                      # serve files as they are (no Jekyll processing)
+          git init -q -b gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Publish ${GITHUB_SHA::8}"
+          git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
