@@ -19,7 +19,7 @@ export const SEASONS = [
 ];
 export const KINDS = {
   safest: { name: 'Safest', colour: '#ffb02e', about: 'Avoids steep ground, crater rims, rough, rocky and loose terrain and dust-storm areas, as far as this traveller needs to, even if that takes longer.' },
-  easiest: { name: 'Easiest', colour: '#4cd387', about: 'Least effort: as little climbing as possible.' },
+  efficient: { name: 'Efficient', colour: '#4cd387', about: 'The energy-efficient route, from NASA\'s precise MOLA elevation (1 m steps): as little climbing energy as possible within the slope limits. Dust, rocks and cold can tip the choice between similar routes but never add more than 25%.' },
   shortest: { name: 'Shortest', colour: '#6ec6ff', about: 'Fewest kilometres while staying under the slope limit.' },
 };
 const TRAVELLER_KEYS = ['walk', ...Object.keys(ROVERS)];
@@ -67,12 +67,102 @@ export function optsFor(traveller) {
   return { traveller, noGoDeg: m.noGoDeg, cautionDeg: m.cautionDeg, weights: m.weights };
 }
 
+// ---- The precise route (src/route/engine/): a Web Worker on NASA's 16-bit MOLA blocks ----------
+
+export const DEFAULT_SETTINGS = { roverMaxSlope: 20, footMaxSlope: 15, kUp: 8, weights: { dust: 1, rock: 1, cold: 0.5 } };
+let preciseWorker = null;
+let preciseId = 0;
+/** Run the precise search; a newer call cancels the running one. Resolves to the engine's result. */
+function runPrecise(a, b, traveller, settings, onProgress) {
+  preciseWorker ??= new Worker(new URL('./engine/route.worker.js', import.meta.url), { type: 'module' });
+  const id = ++preciseId;
+  preciseWorker.postMessage({ type: 'cancel', id: id - 1 });
+  const engineSettings = {
+    roverMaxSlope: settings.roverMaxSlope, footMaxSlope: settings.footMaxSlope,
+    kUpRover: settings.kUp, kUpFoot: settings.kUp === 8 ? 10 : settings.kUp, kDown: 1,
+    weights: settings.weights,
+    modes: traveller === 'walk' ? ['foot'] : ['rover', 'foot'],
+  };
+  return new Promise((resolve, reject) => {
+    const onMsg = ({ data }) => {
+      if (data.id !== id) return;
+      if (data.type === 'progress') { onProgress(data); return; }
+      preciseWorker.removeEventListener('message', onMsg);
+      if (data.type === 'result') resolve(data.result);
+      else if (data.type === 'unavailable-data') resolve(null);
+      else reject(new Error(data.message));
+    };
+    preciseWorker.addEventListener('message', onMsg);
+    preciseWorker.postMessage({ type: 'search', id, a, b, settings: engineSettings, base: new URL(import.meta.env.BASE_URL, location.href).href });
+  });
+}
+
+// Turn the engine's result (points with precise elevation) into the planner's route object, and
+// add what the map's data layers say along it (craters, dust, storms, cold) via describe().
+function fromPrecise(result, g, a, opts, res) {
+  const P = result.points;
+  const pts = P.map(([lat, lon]) => [lat, lon]);
+  // the cells of the coarse map grid the route passes through, for describe()
+  const path = [];
+  for (let k = 0; k < P.length; k++) {
+    const [la0, lo0] = k ? P[k - 1] : P[0]; const [la1, lo1] = P[k];
+    const n = k ? Math.max(1, Math.ceil(haversineKm(la0, lo0, la1, lo1) / (g.cellKm * 0.5))) : 1;
+    for (let s = 1; s <= n; s++) {
+      const t = s / n;
+      const i = cellOf(g, la0 + (la1 - la0) * t, lo0 + (lo1 - lo0) * t);
+      if (path[path.length - 1] !== i) path.push(i);
+    }
+  }
+  if (path.length === 1) path.push(path[0]);
+  const d = describe(g, path, a, opts, res);
+  // precise numbers replace the map-tile ones
+  const seg = [0]; const slope = [result.segments[0]?.slope_deg ?? 0];
+  let hours = 0; let steepKm = 0;
+  for (let k = 1; k < P.length; k++) {
+    const s = result.segments[k - 1];
+    seg.push(seg[k - 1] + s.length_km);
+    slope.push(s.slope_deg);
+    const L0 = s.length_km; const dz = (P[k][2] - P[k - 1][2]) / 1000;
+    hours += L0 / (6 * Math.exp(-3.5 * Math.abs(dz / Math.max(L0, 1e-6) + 0.05)));
+    if (s.slope_deg > opts.cautionDeg) steepKm += L0;
+  }
+  const elev = P.map((p) => p[2] / 1000);
+  const hard = new Uint8Array(P.length);
+  const nearestPoint = (lat, lon) => {
+    let best = 0; let bd = Infinity;
+    P.forEach(([la, lo], k) => { const dd = haversineKm(lat, lon, la, lo); if (dd < bd) { bd = dd; best = k; } });
+    return best;
+  };
+  P.forEach(([lat, lon], k) => {
+    const i = cellOf(g, lat, lon);
+    hard[k] = slope[k] > opts.cautionDeg || (g.craterId[i] >= 0 && g.crater[i] > 0.15) || res.soft[i] > 0.5 || res.rocky[i] > 0.5 ? 1 : 0;
+  });
+  // the dangers found along the cells, placed on the nearest precise point; the slope one is redone
+  const dangers = d.dangers.filter((x) => x.type !== 'slope').map((x) => {
+    const [lat, lon] = cellLatLon(g, path[Math.min(x.k, path.length - 1)]);
+    return { ...x, k: nearestPoint(lat, lon) };
+  });
+  const steep = slope.reduce((bi, v, k) => (v > slope[bi] ? k : bi), 0);
+  dangers.push({ type: 'slope', k: steep, title: `${slope[steep] > opts.cautionDeg ? 'Steep' : 'Steepest point'}: ${slope[steep].toFixed(1)}° slope`,
+    text: `Steepest stretch of this route, from NASA's precise MOLA elevation (${result.finest}, ~${fmtKm(result.finest_km)} cells). Steepest slope inside any cell it crosses: ${result.totals.max_slope_deg}°.` });
+  dangers.sort((x, y) => x.k - y.k);
+  return {
+    ...d, pts, seg, slope, elev, hard, dangers, hours, steepKm,
+    dist: result.totals.length_km, up: result.totals.climb_m / 1000, down: result.totals.descent_m / 1000,
+    maxSlope: result.totals.max_slope_deg, lo: Math.min(...elev), hi: Math.max(...elev),
+    points: pts, bounds: routeBounds(pts), precise: result,
+  };
+}
+
 /**
  * Builds the grid and finds the three routes for one traveller. Kept separate from the UI so
  * two rovers can later be compared on the same A and B (call it twice, reuse the grid).
  */
-export async function computeRoutes(a, b, season, traveller, onProgress = () => {}, grid = null) {
+export async function computeRoutes(a, b, season, traveller, onProgress = () => {}, grid = null, settings = DEFAULT_SETTINGS) {
   const opts = optsFor(traveller);
+  // the precise route runs in its own worker at the same time
+  const precisePromise = runPrecise(a, b, traveller, settings, (p) => onProgress(`Precise route (NASA MOLA, ${p.level}${p.mode === 'foot' ? ', on foot' : ''}): ${Math.round((p.fraction ?? 0) * 100)}%…`))
+    .catch((err) => { console.error(err); return null; });
   const g = grid ?? await buildGrid(a, b, season, onProgress);
   onProgress(`Searching ${(g.rows * g.cols).toLocaleString()} terrain cells (${g.cellKm.toFixed(1)} km each)…`);
   const start = cellOf(g, a.lat, a.lon);
@@ -80,7 +170,7 @@ export async function computeRoutes(a, b, season, traveller, onProgress = () => 
   const res = await runSearch(g, opts, start, goal);
   const bLon = g.lonMin + ((goal % g.cols) + 0.5) * g.dLon;
   const routes = {};
-  for (const k of Object.keys(KINDS)) {
+  for (const k of ['safest', 'easiest', 'shortest']) {
     const r = res.routes[k];
     // A and B in the same terrain cell: the route is just A -> B
     const path = r.path && r.path.length === 1 ? [r.path[0], r.path[0]] : r.path;
@@ -93,7 +183,20 @@ export async function computeRoutes(a, b, season, traveller, onProgress = () => 
       routes[k].bounds = routeBounds(pts);
     }
   }
-  return { g, routes, opts, traveller, season };
+  // the efficient route: precise if the MOLA blocks are built, else the map-tile estimate
+  const precise = await precisePromise;
+  let preciseState = 'missing';
+  if (precise?.status === 'ok' || precise?.status === 'foot-only') {
+    routes.efficient = fromPrecise(precise, g, a, opts, res);
+    preciseState = precise.status;
+  } else if (precise?.status === 'unavailable') {
+    routes.efficient = null;
+    preciseState = 'unavailable';
+  } else if (routes.easiest) {
+    routes.efficient = { ...routes.easiest, approximate: true };
+  }
+  delete routes.easiest;
+  return { g, routes, opts, traveller, season, precise, preciseState };
 }
 
 // ---- What a route goes through --------------------------------------------------------
@@ -234,6 +337,21 @@ function explain(result, kind) {
 
   // can it be done (under the model's assumptions)?
   const tooFar = model.rangeKm != null && r.dist > model.rangeKm;
+  if (kind === 'efficient' && r.precise) {
+    const p = r.precise;
+    const lim = p.mode === 'foot' ? result.settings.footMaxSlope : result.settings.roverMaxSlope;
+    out.why.unshift(`Least energy: ${p.totals.energy_km_equiv.toLocaleString()} km-equivalent of flat ${p.mode === 'foot' ? 'walking' : 'driving'} (distance plus ${p.mode === 'foot' ? result.settings.kUp === 8 ? 10 : result.settings.kUp : result.settings.kUp}× every km climbed), found coarse to fine on NASA MOLA (${p.levels.filter((l) => l.mode === p.mode).map((l) => l.level).join(' → ')}).`);
+    if (p.totals.extra_cost_from_secondary_pct > 0.1) out.why.push(`Dust, rocks and cold add ${p.totals.extra_cost_from_secondary_pct}% to its energy (capped at 25%).`);
+    out.verdict = {
+      ok: !tooFar,
+      text: tooFar
+        ? `Beyond ${name}'s capabilities: ${fmtKm(r.dist)} is far more than it could manage (${model.rangeWhy}). The route is shown only to compare terrain.`
+        : `${p.mode === 'foot' ? 'Walkable' : 'Drivable'} under the limits: no step and no cell crossed steeper than ${lim}° (steepest ${p.totals.max_slope_deg}°), checked on MOLA at ~${fmtKm(p.finest_km)}. Not checked: boulders, dunes and metre-scale slopes.`,
+    };
+    if (result.preciseState === 'foot-only') out.warnings.push(`No rover route within ${result.settings.roverMaxSlope}°: this is the on-foot route (limit ${result.settings.footMaxSlope}°).`);
+    if (traveller !== 'walk' && r.dist > RECORD_KM && !tooFar) out.warnings.push(`At ${fmtKm(r.dist)}, this is longer than any rover has ever driven (Opportunity's record: 45.16 km in 14 years).`);
+    return out;
+  }
   out.verdict = {
     ok: !tooFar,
     text: tooFar
@@ -258,7 +376,8 @@ export function createRoutePlanner(map, params, onChange) {
     a: null, b: null,
     traveller: TRAVELLER_KEYS.includes(params.get('tr')) ? params.get('tr') : 'curiosity',
     season: Math.min(3, Math.max(0, parseInt(params.get('ss'), 10) || 0)),
-    kind: KINDS[params.get('rk')] ? params.get('rk') : 'safest',
+    kind: KINDS[params.get('rk')] ? params.get('rk') : params.get('rk') === 'easiest' ? 'efficient' : 'safest',
+    settings: structuredClone(DEFAULT_SETTINGS),
     result: null,
     busy: false,
     fresh: false, // a route was just calculated (the views zoom to it once)
@@ -301,6 +420,36 @@ export function createRoutePlanner(map, params, onChange) {
     seasonSelect.title = `${SEASONS[state.season].name}, ${SEASONS[state.season].ls}`;
     renderProfileCard();
   }
+
+  // ---- route settings (the efficient route): slope limits, climbing penalty, secondary weights
+  let settingsTimer = 0;
+  const replanSoon = () => { clearTimeout(settingsTimer); settingsTimer = setTimeout(() => plan(), 350); };
+  function setupSettings() {
+    const S = state.settings;
+    const slider = (id, key, fmt) => {
+      const el = $(id);
+      el.value = key();
+      const out = el.parentElement.querySelector('output');
+      const show = () => { out.textContent = fmt(Number(el.value)); };
+      show();
+      el.oninput = show;
+      return el;
+    };
+    slider('rs-rover', () => S.roverMaxSlope, (v) => `${v}°`).onchange = (e) => { S.roverMaxSlope = Number(e.target.value); replanSoon(); };
+    slider('rs-foot', () => S.footMaxSlope, (v) => `${v}°`).onchange = (e) => { S.footMaxSlope = Number(e.target.value); replanSoon(); };
+    for (const k of ['dust', 'rock', 'cold']) {
+      slider(`rs-${k}`, () => S.weights[k], (v) => `×${v}`).onchange = (e) => { S.weights[k] = Number(e.target.value); replanSoon(); };
+    }
+    $('rs-kup').replaceChildren(...[[3, 'Low'], [8, 'Normal'], [20, 'High']].map(([v, label]) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.textContent = `${label} (${v})`; b.setAttribute('role', 'radio');
+      b.setAttribute('aria-checked', S.kUp === v);
+      b.onclick = () => { S.kUp = v; for (const x of $('rs-kup').children) x.setAttribute('aria-checked', x === b); replanSoon(); };
+      return b;
+    }));
+    $('rs-reset').onclick = () => { state.settings = structuredClone(DEFAULT_SETTINGS); setupSettings(); replanSoon(); };
+  }
+  setupSettings();
 
   // compact profile of the chosen rover, with sources
   function renderProfileCard() {
@@ -391,9 +540,9 @@ export function createRoutePlanner(map, params, onChange) {
       const prev = state.result;
       // same points and season: reuse the terrain grid, only the search changes
       const reuse = prev && prev.a === state.a && prev.b === state.b && prev.season === state.season ? prev.g : null;
-      const res = await computeRoutes(state.a, state.b, state.season, state.traveller, (s) => { if (my === token) status(s); }, reuse);
+      const res = await computeRoutes(state.a, state.b, state.season, state.traveller, (s) => { if (my === token) status(s); }, reuse, state.settings);
       if (my !== token) return;
-      state.result = { ...res, a: state.a, b: state.b };
+      state.result = { ...res, a: state.a, b: state.b, settings: structuredClone(state.settings) };
       render();
       fitRoute();
       state.fresh = true;
@@ -516,6 +665,7 @@ export function createRoutePlanner(map, params, onChange) {
       return;
     }
     status(`${travellerName(traveller)} · straight-line distance ${fmtKm(g.distKm)} · terrain cells ${g.cellKm.toFixed(1)} km`);
+    renderPreciseNote();
     if (!routes[state.kind]) state.kind = found[0];
     for (const k of [...found.filter((x) => x !== state.kind), state.kind]) {
       const chosen = k === state.kind;
@@ -538,8 +688,9 @@ export function createRoutePlanner(map, params, onChange) {
       b.className = 'route-tab';
       b.setAttribute('aria-pressed', k === state.kind);
       b.disabled = !r;
-      b.innerHTML = `<span class="dot" style="background:${info.colour}"></span><span class="t-name">${info.name}</span>` +
-        `<span class="t-sub">${r ? `${fmtKm(r.dist)} · ${travelTime(r, traveller).short}` : 'no route'}</span>`;
+      const none = k === 'efficient' && state.result.preciseState === 'unavailable' ? 'Path unavailable' : 'no route';
+      b.innerHTML = `<span class="dot" style="background:${info.colour}"></span><span class="t-name">${info.name}${r?.approximate ? ' <span class="sub">(estimate)</span>' : ''}</span>` +
+        `<span class="t-sub">${r ? `${fmtKm(r.dist)} · ${travelTime(r, traveller).short}` : none}</span>`;
       b.onclick = () => { state.kind = k; onChange(); render(); emit(); };
       return b;
     }));
@@ -569,6 +720,36 @@ export function createRoutePlanner(map, params, onChange) {
     }));
     $('route-no-dangers').hidden = r.dangers.length > 0;
     $('route-results').hidden = false;
+  }
+
+  // What happened to the precise (efficient) route: unavailable / on foot only / not built here
+  function renderPreciseNote() {
+    const box = $('route-precise-note');
+    const R = state.result;
+    const S = R.settings;
+    box.className = 'verdict route-precise-note';
+    if (R.preciseState === 'unavailable') {
+      const bl = R.precise.blocked;
+      box.classList.add('bad');
+      box.innerHTML = `<strong>Path unavailable.</strong> ${R.traveller === 'walk' ? 'On foot' : 'Neither a rover'} (max ${R.traveller === 'walk' ? S.footMaxSlope : `${S.roverMaxSlope}°) nor on foot (max ${S.footMaxSlope}`}°) can get from A to B.` +
+        (bl?.slope_deg != null ? ` The gentlest way still has a ${bl.slope_deg}° stretch, at ${formatLatLon(bl.where[0], wrap(bl.where[1]))} (⛔ on the map).` : '');
+      if (bl?.where) {
+        L.marker([bl.where[0], wrap(bl.where[1])], {
+          pane: 'route', keyboard: false, title: 'Steepest unavoidable stretch',
+          icon: L.divIcon({ className: '', html: '<span class="danger-pin danger-blocked">⛔</span>', iconSize: [26, 26], iconAnchor: [13, 13] }),
+        }).bindPopup(`<strong>Steepest unavoidable stretch: ${bl.slope_deg}°</strong><br>Every way from A to B crosses ground at least this steep (NASA MOLA).`).addTo(dangerLayer);
+      }
+    } else if (R.preciseState === 'foot-only' && R.traveller !== 'walk') {
+      box.classList.add('warn');
+      box.innerHTML = `<strong>On foot only.</strong> No rover route within ${S.roverMaxSlope}°; the efficient route is the on-foot route (max ${S.footMaxSlope}°).`;
+    } else if (R.preciseState === 'missing') {
+      box.classList.add('warn');
+      box.innerHTML = 'The efficient route is an <strong>estimate from the map tiles</strong>: the precise NASA MOLA grids aren\'t built in this copy (see tools/build_route_grids.py).';
+    } else {
+      box.hidden = true;
+      return;
+    }
+    box.hidden = false;
   }
 
   function renderExplanation(x) {
